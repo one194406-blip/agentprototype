@@ -1,0 +1,355 @@
+import os
+import base64
+import json
+import requests
+import logging
+import asyncio
+import threading
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
+from dotenv import load_dotenv
+from google import genai
+import websockets
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# Configuration
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
+
+@app.route('/voice-agent', methods=['POST'])
+def voice_agent():
+    logger.info("Received request for /voice-agent")
+    try:
+        data = request.json
+        if not data or 'audio_base64' not in data:
+            logger.warning("Missing audio_base64 in request body")
+            return jsonify({"error": "Missing audio_base64 in request body"}), 400
+
+        audio_base64 = data['audio_base64']
+        audio_binary = base64.b64decode(audio_base64)
+
+        # 1. Sarvam Speech to Text
+        stt_response = sarvam_stt(audio_binary)
+        if not stt_response or 'transcript' not in stt_response:
+            logger.error(f"STT Failed or no transcript: {stt_response}")
+            return jsonify({"error": "Failed to transcribe audio", "details": stt_response}), 500
+        
+        transcript = stt_response['transcript']
+        logger.info(f"Transcript received: {transcript}")
+
+        # 2. Gemini Call Agent
+        print("Calling Gemini Agent...")
+        gemini_response = gemini_agent(transcript)
+        
+        # 3. Parse Gemini Response
+        agent_data = parse_gemini_response(gemini_response)
+        print(f"Gemini response parsed: {agent_data}")
+        
+        # 4. Sarvam Text to Speech
+        print("Calling Sarvam TTS...")
+        tts_response = sarvam_tts(agent_data['response_text'])
+        
+        # Final Response
+        audio_data = tts_response.get('audios', [None])[0] if tts_response else None
+        
+        # Consolidated Log for Debugging
+        print("--- Voice Agent Response Summary ---")
+        print(f"1. STT Transcript: {transcript}")
+        print(f"2. Agent Response Text: {agent_data['response_text']}")
+        print(f"3. TTS Audio: {'RECEIVED' if audio_data else 'MISSING'} (Length: {len(audio_data) if audio_data else 0})")
+        print("-------------------------------------")
+
+        return jsonify({
+            "audio": audio_data,
+            "transcript": agent_data['response_text'],
+            "intent": agent_data.get('intent'),
+            "action": agent_data.get('action'),
+            "input_transcript": transcript
+        })
+
+    except Exception as e:
+        print(f"Unhandled exception in /voice-agent: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+def sarvam_stt(audio_binary):
+    url = "https://api.sarvam.ai/speech-to-text"
+    headers = {"api-subscription-key": SARVAM_API_KEY}
+    
+    # Strictly matching the curl -F fields in order
+    data = [
+        ('model', 'saarika:v2.5'),
+        ('language_code', 'en-IN')
+    ]
+    
+    files = {
+        'file': ('file.wav', audio_binary, 'audio/wav')
+    }
+
+    print(f"STT Request URL: {url}")
+    print(f"STT Payload Data: {data}")
+    
+    try:
+        # requests will automatically set Content-Type to multipart/form-data with boundary
+        response = requests.post(url, headers=headers, files=files, data=data)
+        
+        print(f"STT Status Code: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            print("STT Transcription successful")
+            return result
+        else:
+            print(f"STT API Error ({response.status_code}): {response.text}")
+            return {"error": response.text, "status_code": response.status_code}
+            
+    except Exception as e:
+        print(f"STT Request failed with exception: {e}")
+        return {"error": str(e), "status_code": 500}
+
+def gemini_agent(transcript):
+    model_name = 'gemini-2.5-flash'
+    print(f"Generating content with Gemini model: {model_name}")
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=transcript,
+            config={
+                'system_instruction': "You are a professional call center AI assistant. Analyze the customer's query and respond in JSON format with: response_text (your helpful response), intent (the customer's intent), action (any action needed), and language (detected language code like en-IN, hi-IN, etc.)"
+            }
+        )
+        return response.text
+    except Exception as e:
+        print(f"Error in gemini_agent with model {model_name}: {str(e)}")
+        raise e
+
+def parse_gemini_response(text):
+    # Remove markdown code blocks if present
+    cleaned_text = text.replace('```json', '').replace('```', '').strip()
+    try:
+        return json.loads(cleaned_text)
+    except Exception as e:
+        return {
+            "response_text": "I apologize, there was a technical issue. Please repeat your query.",
+            "intent": "error",
+            "action": "none",
+            "error": str(e),
+            "raw_response": text
+        }
+
+def sarvam_tts(text):
+    url = "https://api.sarvam.ai/text-to-speech"
+    headers = {
+        "api-subscription-key": SARVAM_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "target_language_code": "en-IN",
+        "speaker": "manisha",
+        "pitch": 0,
+        "pace": 1,
+        "loudness": 1,
+        "speech_sample_rate": 16000,
+        "enable_preprocessing": True,
+        "model": "bulbul:v2",
+        "inputs": [text],
+        "output_audio_format": "wav"
+    }
+    
+    print(f"Making TTS request to {url}")
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        print(f"TTS Response Status Code: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            print(f"TTS Response Keys: {list(result.keys())}")
+            if 'audios' in result and result['audios']:
+                audio_str = result['audios'][0]
+                print(f"TTS Audio received, length: {len(audio_str)}")
+                print(f"Audio prefix: {audio_str[:50]}")
+            return result
+        else:
+            print(f"TTS Error Response: {response.text}")
+            return None
+    except Exception as e:
+        print(f"Exception during TTS request: {str(e)}")
+        return None
+
+@app.route('/voice-agent', methods=['POST'])
+def voice_agent_legacy():
+    # Keeping old REST endpoint for compatibility if needed
+    return voice_agent() # Calls the legacy REST function
+
+# --- Real-time WebSocket Logic ---
+
+class SarvamSession:
+    def __init__(self, sid):
+        self.sid = sid
+        self.stt_ws = None
+        self.tts_ws = None
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+        
+    def _run_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    async def connect_stt(self):
+        url = f"{STT_WS_URL}?model=saarika:v2.5&language_code=en-IN"
+        headers = {
+            "api-subscription-key": SARVAM_API_KEY,
+            "x-api-key": SARVAM_API_KEY,
+            "Origin": "https://api.sarvam.ai",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        print(f"--- [STT] Attempting Handshake with Sarvam WS (URL: {STT_WS_URL}) ---")
+        try:
+            self.stt_ws = await websockets.connect(url, additional_headers=headers)
+            print(f"--- [STT] WebSocket CONNECTED successfully for session {self.sid} ---")
+            asyncio.run_coroutine_threadsafe(self.receive_stt(), self.loop)
+        except Exception as e:
+            print(f"--- [STT] WebSocket CONNECTION FAILED: {e} ---")
+
+    async def connect_tts(self):
+        url = f"{TTS_WS_URL}"
+        headers = {
+            "api-subscription-key": SARVAM_API_KEY,
+            "x-api-key": SARVAM_API_KEY,
+            "Origin": "https://api.sarvam.ai",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        print(f"--- [TTS] Attempting Handshake with Sarvam WS (URL: {TTS_WS_URL}) ---")
+        try:
+            self.tts_ws = await websockets.connect(url, additional_headers=headers)
+            print(f"--- [TTS] WebSocket CONNECTED successfully for session {self.sid} ---")
+            
+            # Send initial config
+            config = {
+                "target_language_code": "en-IN",
+                "speaker": "manisha",
+                "model": "bulbul:v2",
+                "speech_sample_rate": 16000,
+                "enable_preprocessing": True
+            }
+            print(f"--- [TTS] Sending initial config: {config} ---")
+            await self.tts_ws.send(json.dumps(config))
+            asyncio.run_coroutine_threadsafe(self.receive_tts(), self.loop)
+        except Exception as e:
+            print(f"--- [TTS] WebSocket CONNECTION FAILED: {e} ---")
+
+    async def send_audio(self, audio_chunk):
+        if self.stt_ws:
+            await self.stt_ws.send(audio_chunk)
+
+    async def receive_stt(self):
+        try:
+            async for message in self.stt_ws:
+                data = json.loads(message)
+                print(f"--- [STT] Received Message: {data.get('transcript', '')[:50]}... (is_final: {data.get('is_final')}) ---")
+                socketio.emit('stt-transcript', data, room=self.sid)
+                
+                if data.get('is_final'):
+                    transcript = data.get('transcript')
+                    print(f"--- [STT] Processing Final Transcript: {transcript} ---")
+                    # Process with Gemini
+                    asyncio.run_coroutine_threadsafe(self.process_gemini(transcript), self.loop)
+        except Exception as e:
+            print(f"--- [STT] Receive Error: {e} ---")
+
+    async def process_gemini(self, transcript):
+        try:
+            print(f"--- [GEMINI] Sending transcript to Gemini... ---")
+            response_text = gemini_agent(transcript)
+            agent_data = parse_gemini_response(response_text)
+            text_to_speak = agent_data['response_text']
+            
+            print(f"--- [GEMINI] Agent Responded: {text_to_speak[:50]}... ---")
+            socketio.emit('ai-response', agent_data, room=self.sid)
+            
+            if self.tts_ws:
+                print(f"--- [TTS] Sending text for synthesis: {text_to_speak[:50]}... ---")
+                await self.tts_ws.send(json.dumps({"inputs": [text_to_speak]}))
+        except Exception as e:
+            print(f"--- [GEMINI] Processing Error: {e} ---")
+
+    async def receive_tts(self):
+        try:
+            async for message in self.tts_ws:
+                if isinstance(message, bytes):
+                    # Send binary audio chunk to frontend
+                    # print(f"--- [TTS] Received Binary Chunk ({len(message)} bytes) ---")
+                    socketio.emit('audio-chunk', message, room=self.sid)
+                else:
+                    print(f"--- [TTS] Event Message: {message} ---")
+        except Exception as e:
+            print(f"--- [TTS] Receive Error: {e} ---")
+
+    def close(self):
+        async def _close():
+            if self.stt_ws: await self.stt_ws.close()
+            if self.tts_ws: await self.tts_ws.close()
+            print(f"--- Session {self.sid} CLOSED ---")
+        asyncio.run_coroutine_threadsafe(_close(), self.loop)
+
+sessions = {}
+
+STT_WS_URL = "wss://api.sarvam.ai/speech-to-text/transcribe/ws"
+TTS_WS_URL = "wss://api.sarvam.ai/text-to-speech/stream"
+
+@socketio.on('connect')
+def handle_connect():
+    sid = request.sid
+    print(f"--- Client {sid} CONNECTED to Server ---")
+    sessions[sid] = SarvamSession(sid)
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    sid = request.sid
+    if sid in sessions:
+        sessions[sid].close()
+        del sessions[sid]
+    print(f"--- Client {sid} DISCONNECTED from Server ---")
+
+@socketio.on('start-streaming')
+def handle_start_streaming():
+    sid = request.sid
+    session = sessions.get(sid)
+    if session:
+        print(f"--- [START] Initializing streaming for {sid} ---")
+        asyncio.run_coroutine_threadsafe(session.connect_stt(), session.loop)
+        asyncio.run_coroutine_threadsafe(session.connect_tts(), session.loop)
+
+@socketio.on('audio-data')
+def handle_audio_data(data):
+    sid = request.sid
+    session = sessions.get(sid)
+    if session:
+        # data is expected to be binary audio chunk
+        # Logging very sparingly to avoid spamming
+        # logger.debug(f"Forwarding {len(data)} bytes to STT")
+        asyncio.run_coroutine_threadsafe(session.send_audio(data), session.loop)
+
+if __name__ == '__main__':
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
